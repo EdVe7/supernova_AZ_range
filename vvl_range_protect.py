@@ -4,7 +4,6 @@ import plotly.express as px
 from fpdf import FPDF
 import datetime
 import time
-import os
 import numpy as np
 from streamlit_gsheets import GSheetsConnection
 
@@ -49,6 +48,13 @@ CUSTOM_COLOR_SEQUENCE = ['#FF9800', '#000000', '#FFB74D', '#424242', '#FFE0B2']
 COLUMNS = ['User', 'Date', 'SessionName', 'Time', 'Category', 'Club', 'Start_Dist', 'Lie', 'Impact', 'Curvature', 'Height', 'Direction', 'Proximity', 'Rating']
 CATEGORIES = ["LONG GAME / RANGE", "SHORT GAME", "PUTTING"]
 CLUBS = ["DR", "3W", "5W", "7W", "3H", "3i", "4i", "5i", "6i", "7i", "8i", "9i", "PW", "AW", "GW", "SW", "LW"]
+SESSION_TEMPLATES = [
+    "Test Valutazione AZ",
+    "Wedge Ladder 40-100m",
+    "Approach Precision 125-175m",
+    "Pressure Putting 1-3m",
+    "Tournament Prep Full Bag"
+]
 
 # ==============================================================================
 # 3. SPLASH SCREEN & LOGIN
@@ -114,6 +120,60 @@ def save_shot(shot_data):
     df_final = pd.concat([df_existing, df_new], ignore_index=True)
     conn.update(data=df_final)
     st.cache_data.clear()
+
+def get_period_filtered_df(df_user, period_label, session_name):
+    oggi = datetime.date.today()
+    if period_label == "Sessione Attuale":
+        return df_user[df_user['SessionName'] == session_name]
+    if period_label == "Ultimi 7 Giorni":
+        return df_user[df_user['Date'] >= (oggi - datetime.timedelta(days=7))]
+    if period_label == "Ultimi 30 Giorni":
+        return df_user[df_user['Date'] >= (oggi - datetime.timedelta(days=30))]
+    if period_label == "Ultimo Anno":
+        return df_user[df_user['Date'] >= (oggi - datetime.timedelta(days=365))]
+    return df_user
+
+def compute_priority_insights(df_selected, df_baseline):
+    priorities = []
+    if df_selected.empty:
+        return priorities
+
+    current_rating = df_selected['Rating'].mean()
+    baseline_rating = df_baseline['Rating'].mean() if not df_baseline.empty else current_rating
+    delta_rating = current_rating - baseline_rating
+    priorities.append(
+        f"Qualita` esecuzione media: {current_rating:.2f} (delta vs baseline {delta_rating:+.2f})."
+    )
+
+    worst_cat = (
+        df_selected.groupby('Category')['Rating']
+        .mean()
+        .sort_values()
+        .head(1)
+    )
+    if not worst_cat.empty:
+        priorities.append(
+            f"Priorita` tecnica: {worst_cat.index[0]} (rating medio {worst_cat.iloc[0]:.2f})."
+        )
+
+    if 'Proximity' in df_selected.columns:
+        prox_valid = pd.to_numeric(df_selected['Proximity'], errors='coerce').dropna()
+        if not prox_valid.empty:
+            prox_now = prox_valid.mean()
+            prox_base = pd.to_numeric(df_baseline.get('Proximity', pd.Series(dtype=float)), errors='coerce').dropna().mean() if not df_baseline.empty else prox_now
+            prox_delta = prox_now - prox_base
+            priorities.append(
+                f"Controllo distanza: proximity media {prox_now:.2f}m (delta {prox_delta:+.2f}m)."
+            )
+
+    return priorities[:3]
+
+def kpi_status(value, green_threshold, yellow_threshold):
+    if value >= green_threshold:
+        return "VERDE"
+    if value >= yellow_threshold:
+        return "GIALLO"
+    return "ROSSO"
 
 # ==============================================================================
 # 5. GENERATORE REPORT PDF INTELLIGENTE (Smart PDF)
@@ -220,9 +280,12 @@ def generate_pro_pdf(df, user, period_name):
 # 6. INTERFACCIA APP PRINCIPALE
 # ==============================================================================
 st.sidebar.markdown(f"<h3 style='color:{COLORS['BrandOrange']}'>👤 Atleta: {st.session_state['user']}</h3>", unsafe_allow_html=True)
-session_name = st.sidebar.text_input("Sessione / Note", "Test Valutazione AZ")
+template_pick = st.sidebar.selectbox("Template Sessione", SESSION_TEMPLATES)
+session_name = st.sidebar.text_input("Sessione / Note", template_pick)
+app_mode = st.sidebar.radio("Modalita`", ["Atleta", "Coach"], horizontal=True)
+period_options = ["Sessione Attuale", "Ultimi 7 Giorni", "Ultimi 30 Giorni", "Ultimo Anno", "Tutti i Dati (Lifelong)"]
 
-tab_in, tab_an = st.tabs(["🎯 REGISTRO TELEMETRIA", "📊 ANALYTICS & REPORT"])
+tab_in, tab_an, tab_coach = st.tabs(["🎯 REGISTRO TELEMETRIA", "📊 ANALYTICS & REPORT", "🏌️ COACH CENTER"])
 
 # --- TAB 1: INSERIMENTO DATI ---
 with tab_in:
@@ -289,12 +352,9 @@ with tab_an:
     df_all = load_data()
     df_user = df_all[df_all['User'] == st.session_state['user']]
     
-    periodo = st.selectbox("Filtro Temporale", ["Sessione Attuale", "Ultimi 7 Giorni", "Ultimi 30 Giorni", "Tutti i Dati (Lifelong)"])
-    oggi = datetime.date.today()
-    if periodo == "Sessione Attuale": df_f = df_user[df_user['SessionName'] == session_name]
-    elif periodo == "Ultimi 7 Giorni": df_f = df_user[df_user['Date'] >= (oggi - datetime.timedelta(days=7))]
-    elif periodo == "Ultimi 30 Giorni": df_f = df_user[df_user['Date'] >= (oggi - datetime.timedelta(days=30))]
-    else: df_f = df_user
+    periodo = st.selectbox("Filtro Temporale", period_options)
+    df_f = get_period_filtered_df(df_user, periodo, session_name)
+    baseline = get_period_filtered_df(df_user, "Ultimi 30 Giorni", session_name)
 
     if df_f.empty:
         st.warning("Nessun dato registrato nel periodo selezionato.")
@@ -302,6 +362,23 @@ with tab_an:
         pdf_bytes = generate_pro_pdf(df_f, st.session_state['user'], periodo)
         st.download_button("📄 SCARICA REPORT AZ COMPLETO (PDF)", data=pdf_bytes, file_name=f"AZ_Report_{st.session_state['user']}.pdf", mime="application/pdf")
         st.divider()
+
+        st.markdown("### Priorita` automatiche della settimana")
+        for p in compute_priority_insights(df_f, baseline):
+            st.markdown(f"- {p}")
+
+        c_status_1, c_status_2, c_status_3 = st.columns(3)
+        rating_now = df_f['Rating'].mean()
+        top_exec_pct = (len(df_f[df_f['Rating'] == 3]) / len(df_f)) * 100 if len(df_f) > 0 else 0
+        prox_now = pd.to_numeric(df_f['Proximity'], errors='coerce').dropna().mean() if 'Proximity' in df_f.columns else np.nan
+        with c_status_1:
+            st.metric("Semaforo Qualita`", kpi_status(rating_now, 2.40, 2.00), f"{rating_now:.2f} rating medio")
+        with c_status_2:
+            st.metric("Semaforo Esecuzioni Top", kpi_status(top_exec_pct, 45, 30), f"{top_exec_pct:.1f}% voto 3")
+        with c_status_3:
+            prox_delta_txt = "n/a" if np.isnan(prox_now) else f"{prox_now:.2f}m"
+            prox_status = "VERDE" if (not np.isnan(prox_now) and prox_now < 8) else ("GIALLO" if (not np.isnan(prox_now) and prox_now < 15) else "ROSSO")
+            st.metric("Semaforo Proximity", prox_status, prox_delta_txt)
 
         cat_grafici = st.radio("Dettaglio Grafici per Area", CATEGORIES, horizontal=True)
         df_p = df_f[df_f['Category'] == cat_grafici].copy()
@@ -346,6 +423,70 @@ with tab_an:
                 
         else:
             st.info("Dati insufficienti in questa categoria per generare i grafici.")
+
+        st.divider()
+        st.markdown("### Trend settimanale")
+        trend_df = df_user.copy()
+        trend_df = trend_df[trend_df['Date'].notna()]
+        if not trend_df.empty:
+            trend_df['Week'] = pd.to_datetime(trend_df['Date']).dt.to_period('W').astype(str)
+            trend_plot = trend_df.groupby('Week').agg(
+                Rating_Medio=('Rating', 'mean'),
+                Colpi=('Rating', 'count')
+            ).reset_index()
+            fig_trend = px.line(
+                trend_plot,
+                x='Week',
+                y='Rating_Medio',
+                markers=True,
+                title="Andamento rating medio per settimana",
+                color_discrete_sequence=[COLORS['BrandOrange']]
+            )
+            st.plotly_chart(fig_trend, use_container_width=True)
+
+# --- TAB 3: COACH CENTER ---
+with tab_coach:
+    st.markdown("## Vista Coach PGA - Multi Atleta")
+    df_all = load_data()
+    all_users = sorted([u for u in df_all['User'].dropna().unique().tolist() if str(u).strip() != ""])
+    if not all_users:
+        st.info("Nessun atleta disponibile nel database.")
+    else:
+        selected_users = st.multiselect("Seleziona atleti da confrontare", all_users, default=[st.session_state['user']] if st.session_state['user'] in all_users else all_users[:1])
+        coach_period = st.selectbox("Periodo Coach", period_options, index=2)
+        if selected_users:
+            rows = []
+            for u in selected_users:
+                df_u = df_all[df_all['User'] == u]
+                df_u_f = get_period_filtered_df(df_u, coach_period, session_name)
+                if df_u_f.empty:
+                    continue
+                prox_mean = pd.to_numeric(df_u_f['Proximity'], errors='coerce').dropna().mean()
+                rows.append({
+                    'Atleta': u,
+                    'Colpi': len(df_u_f),
+                    'Rating Medio': round(df_u_f['Rating'].mean(), 2),
+                    'Top % (Voto 3)': round((len(df_u_f[df_u_f['Rating'] == 3]) / len(df_u_f)) * 100, 1),
+                    'Proximity Media (m)': round(prox_mean, 2) if not np.isnan(prox_mean) else None
+                })
+            if rows:
+                coach_df = pd.DataFrame(rows).sort_values(['Rating Medio', 'Top % (Voto 3)'], ascending=False)
+                st.markdown("### Leaderboard allenamento")
+                st.dataframe(coach_df, use_container_width=True)
+
+                fig_cmp = px.bar(
+                    coach_df,
+                    x='Atleta',
+                    y='Rating Medio',
+                    color='Atleta',
+                    title='Confronto rating medio atleti',
+                    color_discrete_sequence=px.colors.qualitative.Bold
+                )
+                st.plotly_chart(fig_cmp, use_container_width=True)
+            else:
+                st.warning("Nessun dato per il gruppo selezionato nel periodo indicato.")
+        else:
+            st.info("Seleziona almeno un atleta per attivare il confronto.")
 
 if st.sidebar.button("LOGOUT / CAMBIA UTENTE"):
     st.session_state["logged_in"] = False
